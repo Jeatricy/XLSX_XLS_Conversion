@@ -7,7 +7,6 @@ Excel 批量格式转换工具（xlsx ⇄ xls）
 - 全局字体：微软雅黑（已放大至合适尺寸）
 - 窗口图标：icon.ico（根目录下）
 """
-import os
 import traceback
 from pathlib import Path
 import threading
@@ -28,11 +27,18 @@ def iter_files(src_dir: Path, ext: str, recursive: bool):
 # -------------------- 转换引擎（仅 Excel COM） --------------------
 def convert_with_excel_com(in_path: Path, out_path: Path):
     """使用 Microsoft Excel 进行转换，失败则抛出错误"""
+    import pythoncom
     import win32com.client
-    excel = win32com.client.Dispatch("Excel.Application")
-    excel.Visible = False
-    excel.DisplayAlerts = False
+
+    # COM 必须在使用它的线程上初始化；转换由 GUI 工作线程执行。
+    pythoncom.CoInitialize()
+    excel = None
+    wb = None
     try:
+        # 使用独立的 Excel 实例，避免连接或关闭用户已打开的 Excel 会话。
+        excel = win32com.client.DispatchEx("Excel.Application")
+        excel.Visible = False
+        excel.DisplayAlerts = False
         wb = excel.Workbooks.Open(str(in_path))
         out_ext = out_path.suffix.lower()
         if out_ext == ".xlsx":
@@ -44,8 +50,21 @@ def convert_with_excel_com(in_path: Path, out_path: Path):
         ensure_dir(out_path.parent)
         wb.SaveAs(str(out_path), FileFormat=file_format)
         wb.Close(SaveChanges=False)
+        wb = None
     finally:
-        excel.Quit()
+        try:
+            if wb is not None:
+                try:
+                    wb.Close(SaveChanges=False)
+                except Exception:
+                    pass
+            if excel is not None:
+                excel.Quit()
+        finally:
+            # 释放 COM 对象引用后，再关闭当前线程的 COM apartment。
+            wb = None
+            excel = None
+            pythoncom.CoUninitialize()
 
 # -------------------- 路径规划 --------------------
 def plan_output_path(in_path: Path, src_dir: Path, dst_dir: Path, out_ext: str):
@@ -279,13 +298,32 @@ class App(ctk.CTk):
             messagebox.showwarning("提示", "转换正在进行中")
             return
 
+        mode = self.mode_var.get()
+        conflict_mode = self.conflict_var.get()
+        if not messagebox.askokcancel(
+            "格式兼容性提示",
+            "Excel 的兼容性提示不会显示，目标格式不支持的内容可能无法保留。"
+            "请在转换后检查输出文件。\n\n仍要继续吗？",
+        ):
+            return
+
         # 检查 Excel COM 可用性
+        excel = None
         try:
             import win32com.client
-            win32com.client.Dispatch("Excel.Application")
-        except:
-            messagebox.showerror("错误", "未检测到 Microsoft Excel 或 pywin32 未正确安装，无法使用 COM 引擎转换。")
+            excel = win32com.client.DispatchEx("Excel.Application")
+            excel.Visible = False
+            excel.Quit()
+        except Exception as e:
+            if excel is not None:
+                try:
+                    excel.Quit()
+                except Exception:
+                    pass
+            messagebox.showerror("错误", f"无法启动或关闭 Excel COM 检查实例：{e}")
             return
+        finally:
+            excel = None
 
         self.stop_event.clear()
         self.start_btn.configure(state="disabled")
@@ -299,8 +337,8 @@ class App(ctk.CTk):
             try:
                 ok, fail, skipped = batch_convert(
                     src_dir=src_dir, dst_dir=dst_dir,
-                    mode=self.mode_var.get(),
-                    conflict_mode=self.conflict_var.get(),
+                    mode=mode,
+                    conflict_mode=conflict_mode,
                     stop_event=self.stop_event,
                     log_cb=self._log
                 )
